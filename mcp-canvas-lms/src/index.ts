@@ -6,14 +6,18 @@
  * Exposes Canvas LMS data to Claude via the Model Context Protocol.
  * Tools: get_courses, get_assignments, get_upcoming_deadlines, get_grades,
  *        get_course_modules, get_announcements, get_submission_status,
- *        get_syllabus, get_todo_items
- * Resources: canvas://dashboard
+ *        get_syllabus, get_todo_items, list_course_files, get_file_content
+ * Resources: canvas://dashboard, canvas://courses/{course_id}/files/{file_id}
  */
 
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import {
+    McpServer,
+    ResourceTemplate,
+} from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { PDFParse } from "pdf-parse";
 import { z } from "zod";
-import { CanvasApiClient } from "./canvas-api.js";
+import { CanvasApiClient, CanvasFile } from "./canvas-api.js";
 
 // ─── Configuration ──────────────────────────────────────────────────
 
@@ -46,6 +50,12 @@ const server = new McpServer({
     version: "1.0.0",
 });
 
+const DEFAULT_FILE_LIST_LIMIT = 50;
+const MAX_FILE_LIST_LIMIT = 100;
+const DEFAULT_FILE_TEXT_LIMIT = 20000;
+const MAX_FILE_TEXT_LIMIT = 50000;
+const MAX_DOWNLOAD_BYTES = 15 * 1024 * 1024;
+
 // ─── Helper: strip HTML tags for cleaner LLM output ─────────────────
 
 function stripHtml(html: string | null | undefined): string {
@@ -60,6 +70,189 @@ function stripHtml(html: string | null | undefined): string {
         .replace(/&#39;/g, "'")
         .replace(/\n{3,}/g, "\n\n")
         .trim();
+}
+
+function normalizeWhitespace(text: string): string {
+    return text.replace(/\u0000/g, "").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+function formatBytes(bytes: number | null | undefined): string {
+    if (!bytes || Number.isNaN(bytes)) return "Unknown size";
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function clampLimit(
+    value: number | undefined,
+    fallback: number,
+    max: number
+): number {
+    if (typeof value !== "number" || Number.isNaN(value)) return fallback;
+    return Math.min(Math.max(Math.floor(value), 1), max);
+}
+
+function getCanvasFileUri(courseId: number, fileId: number): string {
+    return `canvas://courses/${courseId}/files/${fileId}`;
+}
+
+function normalizeMimeType(value: string | null | undefined): string | null {
+    if (!value) return null;
+    return value.split(";")[0]?.trim().toLowerCase() ?? null;
+}
+
+function getFileExtension(filename: string): string {
+    const match = filename.toLowerCase().match(/\.([a-z0-9]+)$/);
+    return match ? match[1] : "";
+}
+
+function detectMimeType(file: CanvasFile, downloadedMimeType?: string | null): string {
+    const normalizedDownloaded = normalizeMimeType(downloadedMimeType);
+    if (normalizedDownloaded) return normalizedDownloaded;
+
+    const normalizedCanvas = normalizeMimeType(file["content-type"]);
+    if (normalizedCanvas) return normalizedCanvas;
+
+    switch (getFileExtension(file.filename)) {
+        case "pdf":
+            return "application/pdf";
+        case "txt":
+        case "md":
+            return "text/plain";
+        case "csv":
+            return "text/csv";
+        case "json":
+            return "application/json";
+        case "html":
+        case "htm":
+            return "text/html";
+        case "xml":
+            return "application/xml";
+        default:
+            return "application/octet-stream";
+    }
+}
+
+function isPdfMimeType(mimeType: string, filename: string): boolean {
+    return mimeType === "application/pdf" || getFileExtension(filename) === "pdf";
+}
+
+function isHtmlMimeType(mimeType: string, filename: string): boolean {
+    return (
+        mimeType === "text/html" ||
+        mimeType === "application/xhtml+xml" ||
+        ["html", "htm"].includes(getFileExtension(filename))
+    );
+}
+
+function isTextLikeMimeType(mimeType: string, filename: string): boolean {
+    if (mimeType.startsWith("text/")) return true;
+    if (
+        [
+            "application/json",
+            "application/ld+json",
+            "application/xml",
+            "application/javascript",
+            "application/x-javascript",
+            "application/typescript",
+            "application/x-typescript",
+            "image/svg+xml",
+        ].includes(mimeType)
+    ) {
+        return true;
+    }
+
+    return ["md", "markdown", "csv", "tsv", "yaml", "yml"].includes(
+        getFileExtension(filename)
+    );
+}
+
+function summarizeFile(file: CanvasFile, courseId: number) {
+    const mimeType = detectMimeType(file);
+    return {
+        id: file.id,
+        course_id: courseId,
+        display_name: file.display_name,
+        filename: file.filename,
+        mime_type: mimeType,
+        size: formatBytes(file.size),
+        updated_at: file.updated_at ? formatDate(file.updated_at) : "Unknown",
+        locked: file.locked ?? false,
+        hidden: file.hidden ?? false,
+        can_extract_text:
+            isPdfMimeType(mimeType, file.filename) ||
+            isTextLikeMimeType(mimeType, file.filename),
+        resource_uri: getCanvasFileUri(courseId, file.id),
+        html_url: file.html_url ?? null,
+    };
+}
+
+async function extractFileText(
+    fileId: number,
+    courseId: number,
+    maxChars: number
+): Promise<{
+    file: CanvasFile;
+    mimeType: string;
+    extractionMethod: "pdf" | "text" | "html";
+    extractedText: string;
+    truncated: boolean;
+}> {
+    const download = await canvas.downloadFile(fileId, courseId);
+    const byteSize = download.contentLength ?? download.buffer.byteLength;
+
+    if (byteSize > MAX_DOWNLOAD_BYTES) {
+        throw new Error(
+            `File is ${formatBytes(byteSize)}, which exceeds the ${formatBytes(MAX_DOWNLOAD_BYTES)} read limit.`
+        );
+    }
+
+    const mimeType = detectMimeType(download.file, download.contentType);
+
+    if (isPdfMimeType(mimeType, download.file.filename)) {
+        const parser = new PDFParse({ data: download.buffer });
+        try {
+            const result = await parser.getText();
+            const extractedText = normalizeWhitespace(result.text);
+
+            if (!extractedText) {
+                throw new Error(
+                    "PDF parsing succeeded but no selectable text was found. This is likely a scanned or image-only PDF."
+                );
+            }
+
+            return {
+                file: download.file,
+                mimeType,
+                extractionMethod: "pdf",
+                extractedText: extractedText.slice(0, maxChars),
+                truncated: extractedText.length > maxChars,
+            };
+        } finally {
+            await parser.destroy();
+        }
+    }
+
+    if (isTextLikeMimeType(mimeType, download.file.filename)) {
+        const rawText = new TextDecoder("utf-8").decode(download.buffer);
+        const extractedText = isHtmlMimeType(mimeType, download.file.filename)
+            ? stripHtml(rawText)
+            : normalizeWhitespace(rawText);
+
+        return {
+            file: download.file,
+            mimeType,
+            extractionMethod: isHtmlMimeType(mimeType, download.file.filename)
+                ? "html"
+                : "text",
+            extractedText: extractedText.slice(0, maxChars),
+            truncated: extractedText.length > maxChars,
+        };
+    }
+
+    throw new Error(
+        `Unsupported file type for inline extraction: ${mimeType}. Supported today: PDF and text-like files.`
+    );
 }
 
 // ─── Helper: format date for human-readable output ──────────────────
@@ -262,10 +455,16 @@ server.tool(
                 state: m.state,
                 items:
                     m.items?.map((item) => ({
+                        id: item.id,
                         title: item.title,
                         type: item.type,
+                        content_id: item.content_id ?? null,
                         completed: item.completion_requirement?.completed ?? null,
                         url: item.html_url,
+                        resource_uri:
+                            item.type === "File" && item.content_id
+                                ? getCanvasFileUri(course_id, item.content_id)
+                                : null,
                     })) ?? [],
             }));
             return {
@@ -479,7 +678,169 @@ server.tool(
     }
 );
 
+// 10. list_course_files
+server.tool(
+    "list_course_files",
+    "List files and attachments available in a Canvas course. Use this before reading a PDF or other attachment.",
+    {
+        course_id: z.number().describe("Canvas course ID"),
+        search_term: z
+            .string()
+            .optional()
+            .describe("Optional filename search term"),
+        limit: z
+            .number()
+            .optional()
+            .default(DEFAULT_FILE_LIST_LIMIT)
+            .describe(
+                `Maximum number of files to return (default: ${DEFAULT_FILE_LIST_LIMIT}, max: ${MAX_FILE_LIST_LIMIT})`
+            ),
+    },
+    async ({ course_id, search_term, limit }) => {
+        try {
+            const normalizedLimit = clampLimit(
+                limit,
+                DEFAULT_FILE_LIST_LIMIT,
+                MAX_FILE_LIST_LIMIT
+            );
+            const files = await canvas.getCourseFiles(course_id, search_term);
+            const formatted = files
+                .slice(0, normalizedLimit)
+                .map((file) => summarizeFile(file, course_id));
+
+            return {
+                content: [
+                    {
+                        type: "text" as const,
+                        text:
+                            formatted.length > 0
+                                ? JSON.stringify(formatted, null, 2)
+                                : "No course files found matching that query.",
+                    },
+                ],
+            };
+        } catch (error) {
+            return {
+                content: [
+                    {
+                        type: "text" as const,
+                        text: `Error listing course files: ${error instanceof Error ? error.message : String(error)}`,
+                    },
+                ],
+                isError: true,
+            };
+        }
+    }
+);
+
+// 11. get_file_content
+server.tool(
+    "get_file_content",
+    "Read a Canvas attachment. Extracts text from PDFs and text-like files so Claude can work with the contents.",
+    {
+        course_id: z.number().describe("Canvas course ID"),
+        file_id: z.number().describe("Canvas file ID"),
+        max_chars: z
+            .number()
+            .optional()
+            .default(DEFAULT_FILE_TEXT_LIMIT)
+            .describe(
+                `Maximum extracted characters to return (default: ${DEFAULT_FILE_TEXT_LIMIT}, max: ${MAX_FILE_TEXT_LIMIT})`
+            ),
+    },
+    async ({ course_id, file_id, max_chars }) => {
+        try {
+            const normalizedLimit = clampLimit(
+                max_chars,
+                DEFAULT_FILE_TEXT_LIMIT,
+                MAX_FILE_TEXT_LIMIT
+            );
+            const result = await extractFileText(file_id, course_id, normalizedLimit);
+
+            return {
+                content: [
+                    {
+                        type: "text" as const,
+                        text: JSON.stringify(
+                            {
+                                id: result.file.id,
+                                course_id,
+                                display_name: result.file.display_name,
+                                filename: result.file.filename,
+                                mime_type: result.mimeType,
+                                size: formatBytes(result.file.size),
+                                extraction_method: result.extractionMethod,
+                                truncated: result.truncated,
+                                resource_uri: getCanvasFileUri(course_id, result.file.id),
+                                html_url: result.file.html_url ?? null,
+                                content: result.extractedText,
+                            },
+                            null,
+                            2
+                        ),
+                    },
+                ],
+            };
+        } catch (error) {
+            return {
+                content: [
+                    {
+                        type: "text" as const,
+                        text: `Error reading file content: ${error instanceof Error ? error.message : String(error)}`,
+                    },
+                ],
+                isError: true,
+            };
+        }
+    }
+);
+
 // ─── Resources ──────────────────────────────────────────────────────
+
+server.registerResource(
+    "course-file",
+    new ResourceTemplate("canvas://courses/{course_id}/files/{file_id}", {
+        list: undefined,
+    }),
+    {
+        description:
+            "Readable Canvas file content for PDFs and text-like attachments",
+        mimeType: "text/plain",
+    },
+    async (_uri, variables) => {
+        const courseId = Number(variables.course_id);
+        const fileId = Number(variables.file_id);
+
+        if (!Number.isFinite(courseId) || !Number.isFinite(fileId)) {
+            throw new Error("course_id and file_id must both be numeric.");
+        }
+
+        const result = await extractFileText(
+            fileId,
+            courseId,
+            MAX_FILE_TEXT_LIMIT
+        );
+
+        return {
+            contents: [
+                {
+                    uri: getCanvasFileUri(courseId, fileId),
+                    text: [
+                        `Course file: ${result.file.display_name}`,
+                        `Filename: ${result.file.filename}`,
+                        `MIME type: ${result.mimeType}`,
+                        `Extraction method: ${result.extractionMethod}`,
+                        result.truncated
+                            ? `Content truncated to ${MAX_FILE_TEXT_LIMIT} characters.`
+                            : "Content complete.",
+                        "",
+                        result.extractedText,
+                    ].join("\n"),
+                },
+            ],
+        };
+    }
+);
 
 server.resource(
     "dashboard",

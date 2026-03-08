@@ -103,6 +103,33 @@ export interface TodoItem {
     html_url: string;
 }
 
+export interface CanvasFile {
+    id: number;
+    uuid?: string;
+    folder_id?: number | null;
+    display_name: string;
+    filename: string;
+    "content-type"?: string | null;
+    url?: string | null;
+    size?: number | null;
+    html_url?: string | null;
+    created_at?: string | null;
+    updated_at?: string | null;
+    unlock_at?: string | null;
+    lock_at?: string | null;
+    hidden?: boolean;
+    hidden_for_user?: boolean;
+    locked?: boolean;
+    locked_for_user?: boolean;
+}
+
+export interface DownloadedCanvasFile {
+    file: CanvasFile;
+    buffer: Buffer;
+    contentType: string | null;
+    contentLength: number | null;
+}
+
 // ─── Client ─────────────────────────────────────────────────────────
 
 export class CanvasApiClient {
@@ -119,14 +146,20 @@ export class CanvasApiClient {
 
     private async fetchApi<T>(
         path: string,
-        params: Record<string, string> = {},
+        params: Record<string, string | string[]> = {},
         paginate: boolean = true
     ): Promise<T[]> {
         const url = new URL(`${this.baseUrl}/api/v1${path}`);
         url.searchParams.set("per_page", "100");
 
         for (const [key, value] of Object.entries(params)) {
-            url.searchParams.set(key, value);
+            if (Array.isArray(value)) {
+                for (const item of value) {
+                    url.searchParams.append(key, item);
+                }
+            } else {
+                url.searchParams.set(key, value);
+            }
         }
 
         const results: T[] = [];
@@ -194,7 +227,7 @@ export class CanvasApiClient {
         courseId: number,
         includeSyllabus: boolean = false
     ): Promise<Course> {
-        const params: Record<string, string> = {};
+        const params: Record<string, string | string[]> = {};
         if (includeSyllabus) {
             params["include[]"] = "syllabus_body";
         }
@@ -215,7 +248,7 @@ export class CanvasApiClient {
         bucket?: string,
         orderBy: string = "due_at"
     ): Promise<Assignment[]> {
-        const params: Record<string, string> = {
+        const params: Record<string, string | string[]> = {
             order_by: orderBy,
         };
         if (bucket) {
@@ -385,5 +418,76 @@ export class CanvasApiClient {
      */
     async getTodoItems(): Promise<TodoItem[]> {
         return this.fetchApi<TodoItem>("/users/self/todo");
+    }
+
+    /**
+     * Get files available within a course.
+     */
+    async getCourseFiles(
+        courseId: number,
+        searchTerm?: string
+    ): Promise<CanvasFile[]> {
+        const params: Record<string, string | string[]> = {};
+        if (searchTerm) {
+            params.search_term = searchTerm;
+        }
+
+        const files = await this.fetchApi<CanvasFile>(
+            `/courses/${courseId}/files`,
+            params
+        );
+
+        return files.sort((a, b) => {
+            const dateA = a.updated_at ? new Date(a.updated_at).getTime() : 0;
+            const dateB = b.updated_at ? new Date(b.updated_at).getTime() : 0;
+            return dateB - dateA;
+        });
+    }
+
+    /**
+     * Get metadata for a specific file.
+     */
+    async getFile(fileId: number, courseId?: number): Promise<CanvasFile> {
+        const path = courseId
+            ? `/courses/${courseId}/files/${fileId}`
+            : `/files/${fileId}`;
+        const results = await this.fetchApi<CanvasFile>(path, {}, false);
+        return results[0];
+    }
+
+    /**
+     * Download a file's raw contents.
+     */
+    async downloadFile(fileId: number, courseId?: number): Promise<DownloadedCanvasFile> {
+        const file = await this.getFile(fileId, courseId);
+
+        if (!file.url) {
+            throw new Error(
+                `Canvas file ${fileId} does not expose a downloadable URL.`
+            );
+        }
+
+        const response = await fetch(file.url, {
+            headers: {
+                Authorization: `Bearer ${this.token}`,
+            },
+        });
+
+        if (!response.ok) {
+            const errorText = await response.text();
+            throw new Error(
+                `Canvas file download error ${response.status}: ${response.statusText} — ${errorText}`
+            );
+        }
+
+        const buffer = Buffer.from(await response.arrayBuffer());
+        const contentLengthHeader = response.headers.get("content-length");
+
+        return {
+            file,
+            buffer,
+            contentType: response.headers.get("content-type"),
+            contentLength: contentLengthHeader ? Number(contentLengthHeader) : null,
+        };
     }
 }

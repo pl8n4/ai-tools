@@ -8,6 +8,7 @@ An MCP (Model Context Protocol) server that connects Claude to your Canvas LMS a
 - **Shows upcoming assignments** across all courses with due dates
 - **Reports your current grades** and submission status
 - **Surfaces announcements**, modules, syllabi, and Canvas to-do items
+- **Lists course files and attachments** and can extract readable text from PDFs and text-based documents
 - **Gives Claude enough context** to help you plan your week, prioritize tasks, and study smarter
 
 ## Who It's For
@@ -19,6 +20,8 @@ Any student using Canvas LMS who wants an AI study assistant that's actually awa
 - [Node.js](https://nodejs.org/) v18 or later
 - [Claude Desktop](https://claude.ai/download) app
 - A Canvas LMS account with API access
+
+> **Note:** PDF extraction is powered by `pdf-parse` and is best run on Node.js 20+.
 
 ## Setup
 
@@ -87,6 +90,8 @@ Fully quit (`⌘Q` on Mac) and reopen. The Canvas tools should appear in the �
 | `get_submission_status` | Check if you've submitted an assignment + grade |
 | `get_syllabus` | Get the syllabus for a course |
 | `get_todo_items` | Canvas's built-in to-do list |
+| `list_course_files` | List course files/attachments with file IDs |
+| `get_file_content` | Read PDFs and text-like attachments into plain text |
 
 ## Example Prompts
 
@@ -95,6 +100,8 @@ Fully quit (`⌘Q` on Mac) and reopen. The Canvas tools should appear in the �
 - *"What are my current grades?"*
 - *"Show me the modules for my CS course"*
 - *"Have I submitted the latest homework for [course]?"*
+- *"List the files in my Biology course"*
+- *"Read file 12345 from course 67890"*
 - *"Help me plan my study schedule for the next two weeks"*
 
 ## How It Works
@@ -105,13 +112,26 @@ This server uses the **stdio** transport — Claude Desktop launches it as a loc
 Claude Desktop  ←── stdio (MCP) ──→  canvas-mcp  ←── HTTPS ──→  Canvas API
 ```
 
+## Attachment Support
+
+This server can now bridge one of the main Claude Desktop gaps with Canvas:
+
+- It can list course files and attachment metadata
+- It can read **PDFs** and extract plain text for Claude
+- It can also read **text-based files** like `.txt`, `.md`, `.csv`, `.json`, `.html`, and `.xml`
+- Unsupported binary formats such as `.docx`, `.pptx`, images, and spreadsheets are still listed, but their contents are not extracted yet
+
+This means Claude can collaborate on professor-uploaded PDFs directly through the MCP server instead of requiring manual copy/paste.
+
 ## Resources
 
-The server also exposes a `canvas://dashboard` resource that provides a combined overview of courses, grades, upcoming deadlines, and to-do items.
+The server exposes:
+
+- `canvas://dashboard` for a combined overview of courses, grades, upcoming deadlines, and to-do items
+- `canvas://courses/{course_id}/files/{file_id}` for readable attachment content when the file is a PDF or text-like document
 
 ## Security
 
 - Your API token is stored locally in the Claude Desktop config and passed as an environment variable — it is **never sent to Claude's servers**
 - The server is **read-only** — it cannot submit assignments, post discussions, or modify anything in Canvas
 - Treat your API token like a password. If compromised, revoke it immediately in Canvas under Account → Settings → Approved Integrations
-
