@@ -1,6 +1,6 @@
 # ai-tools
 
-A collection of tools, MCP servers, and integrations I've built to make LLMs and AI agents more useful in day-to-day life. Everything here is stuff I actually use — made public in case it's useful to others.
+A collection of tools, MCP servers, and integrations I've built to make LLMs and AI agents more useful in day-to-day life. Everything here is stuff I actually use, made public in case it's useful to others.
 
 ## What's Here
 
